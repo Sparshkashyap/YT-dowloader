@@ -15,7 +15,7 @@ import {
 } from "lucide-react";
 import "./index.css";
 
-const API = import.meta.env.VITE_BACKEND_URL;
+const API = import.meta.env.VITE_API_URL || "http://localhost:5000";
 
 const VIDEO_QUALITIES = [
   { value: "best", label: "Best available" },
@@ -271,16 +271,20 @@ function App() {
               <div className="preview-meta">
                 <p className="preview-title">{videoInfo.title}</p>
                 <p className="preview-uploader">{videoInfo.uploader}</p>
-                <div className="preview-stats">
-                  <span className="preview-stat">
-                    <Clock size={12} /> {formatDuration(videoInfo.duration)}
-                  </span>
-                  {videoInfo.viewCount && (
-                    <span className="preview-stat">
-                      <Eye size={12} /> {formatViews(videoInfo.viewCount)}
-                    </span>
-                  )}
-                </div>
+                {(videoInfo.duration || videoInfo.viewCount) && (
+                  <div className="preview-stats">
+                    {videoInfo.duration && (
+                      <span className="preview-stat">
+                        <Clock size={12} /> {formatDuration(videoInfo.duration)}
+                      </span>
+                    )}
+                    {videoInfo.viewCount && (
+                      <span className="preview-stat">
+                        <Eye size={12} /> {formatViews(videoInfo.viewCount)}
+                      </span>
+                    )}
+                  </div>
+                )}
               </div>
             </div>
           )}

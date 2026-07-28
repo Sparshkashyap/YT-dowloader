@@ -88,14 +88,7 @@ function cookieArgs() {
 // android client can't use cookies at all (yt-dlp silently skips it), so
 // once cookies are present we stick to clients that support cookie auth.
 // The "n"/signature challenge these need is solved by Deno (see Dockerfile).
-const CLIENT_ARGS = [
- "--extractor-args",
- "youtube:player_client=web",
- "--js-runtimes",
- "deno",
- "--remote-components",
- "ejs:github"
-];
+const CLIENT_ARGS = ["--extractor-args", "youtube:player_client=web,tv"];
 
 function commonArgs() {
   return [...cookieArgs(), ...CLIENT_ARGS];
@@ -104,41 +97,41 @@ function commonArgs() {
 // ---------------------------------------------------------------------
 // GET video metadata (title, thumbnail, duration) before downloading
 // ---------------------------------------------------------------------
-app.post("/api/info", (req, res) => {
+app.post("/api/info", async (req, res) => {
   const { url } = req.body;
 
   if (!isValidYoutubeUrl(url)) {
     return res.status(400).json({ message: "Please paste a valid YouTube URL" });
   }
 
-  const args = [...commonArgs(), "--dump-json", "--no-playlist", url];
+  // oEmbed is YouTube's public, unauthenticated metadata endpoint — it isn't
+  // subject to the bot-check/cookie-rotation problems yt-dlp hits on cloud
+  // IPs, so previews stay reliable even when the datacenter IP is flagged.
+  // Trade-off: no duration/view-count (oEmbed doesn't expose them).
+  try {
+    const oembedUrl = `https://www.youtube.com/oembed?url=${encodeURIComponent(
+      url
+    )}&format=json`;
+    const response = await fetch(oembedUrl);
 
-  // execFile (no shell) -> args passed as an array, no injection risk
-  execFile(
-    "yt-dlp",
-    args,
-    { maxBuffer: 1024 * 1024 * 10, timeout: 20000 },
-    (error, stdout, stderr) => {
-      if (error) {
-        console.error("[info error]", stderr || error.message);
-        return res
-          .status(500)
-          .json({ message: "Couldn't fetch video info. Check the link and try again." });
-      }
-      try {
-        const data = JSON.parse(stdout);
-        res.json({
-          title: data.title,
-          thumbnail: data.thumbnail,
-          duration: data.duration,
-          uploader: data.uploader,
-          viewCount: data.view_count,
-        });
-      } catch (e) {
-        res.status(500).json({ message: "Failed to parse video info" });
-      }
+    if (!response.ok) {
+      throw new Error(`oEmbed returned ${response.status}`);
     }
-  );
+
+    const data = await response.json();
+    return res.json({
+      title: data.title,
+      thumbnail: data.thumbnail_url,
+      uploader: data.author_name,
+      duration: null,
+      viewCount: null,
+    });
+  } catch (err) {
+    console.error("[info error]", err.message);
+    return res
+      .status(500)
+      .json({ message: "Couldn't fetch video info. Check the link and try again." });
+  }
 });
 
 // ---------------------------------------------------------------------
