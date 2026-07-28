@@ -3,9 +3,10 @@ FROM node:20-slim
 # yt-dlp needs python3 + pip, and ffmpeg for merging/converting
 RUN apt-get update && \
     apt-get install -y python3 python3-pip ffmpeg curl unzip && \
-    pip3 install --break-system-packages -U yt-dlp && \
-    apt-get clean && rm -rf /var/lib/apt/lists/*
-
+   pip3 install --break-system-packages -U yt-dlp[default] && \
+   yt-dlp --update-to nightly\
+    apt-get clean && rm -rf /var/lib/apt/lists/* 
+    
 # Deno — required so yt-dlp can solve YouTube's signature/"n" JS challenge
 # when using cookies (the android client, which needs no JS solving, does
 # not support cookie auth, so we need a real JS runtime for the web client)

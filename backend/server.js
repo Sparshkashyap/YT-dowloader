@@ -88,7 +88,14 @@ function cookieArgs() {
 // android client can't use cookies at all (yt-dlp silently skips it), so
 // once cookies are present we stick to clients that support cookie auth.
 // The "n"/signature challenge these need is solved by Deno (see Dockerfile).
-const CLIENT_ARGS = ["--extractor-args", "youtube:player_client=web,tv"];
+const CLIENT_ARGS = [
+ "--extractor-args",
+ "youtube:player_client=web",
+ "--js-runtimes",
+ "deno",
+ "--remote-components",
+ "ejs:github"
+];
 
 function commonArgs() {
   return [...cookieArgs(), ...CLIENT_ARGS];
