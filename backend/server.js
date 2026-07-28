@@ -85,6 +85,15 @@ function cookieArgs() {
   return fs.existsSync(COOKIE_FILE) ? ["--cookies", COOKIE_FILE] : [];
 }
 
+// force the Android client — it skips the browser-style signature/PO-token
+// challenge that the default web client now needs a JS runtime to solve.
+// "web" is kept as a fallback in case Android formats are ever missing.
+const CLIENT_ARGS = ["--extractor-args", "youtube:player_client=android,web"];
+
+function commonArgs() {
+  return [...cookieArgs(), ...CLIENT_ARGS];
+}
+
 // ---------------------------------------------------------------------
 // GET video metadata (title, thumbnail, duration) before downloading
 // ---------------------------------------------------------------------
@@ -95,7 +104,7 @@ app.post("/api/info", (req, res) => {
     return res.status(400).json({ message: "Please paste a valid YouTube URL" });
   }
 
-  const args = [...cookieArgs(), "--dump-json", "--no-playlist", url];
+  const args = [...commonArgs(), "--dump-json", "--no-playlist", url];
 
   // execFile (no shell) -> args passed as an array, no injection risk
   execFile(
@@ -152,7 +161,7 @@ app.post("/api/download", (req, res) => {
       ? `bv*[height<=${height}]+ba/b[height<=${height}]`
       : "bv*+ba/b";
     args = [
-      ...cookieArgs(),
+      ...commonArgs(),
       "-f", formatStr,
       "--merge-output-format", "mp4",
       "-o", outputTemplate,
@@ -163,7 +172,7 @@ app.post("/api/download", (req, res) => {
   } else {
     const bitrate = ["128", "192", "320"].includes(quality) ? quality : "192";
     args = [
-      ...cookieArgs(),
+      ...commonArgs(),
       "-x", "--audio-format", "mp3",
       "--audio-quality", `${bitrate}K`,
       "-o", outputTemplate,
