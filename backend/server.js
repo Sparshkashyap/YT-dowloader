@@ -85,10 +85,10 @@ function cookieArgs() {
   return fs.existsSync(COOKIE_FILE) ? ["--cookies", COOKIE_FILE] : [];
 }
 
-// force the Android client — it skips the browser-style signature/PO-token
-// challenge that the default web client now needs a JS runtime to solve.
-// "web" is kept as a fallback in case Android formats are ever missing.
-const CLIENT_ARGS = ["--extractor-args", "youtube:player_client=android,web"];
+// android client can't use cookies at all (yt-dlp silently skips it), so
+// once cookies are present we stick to clients that support cookie auth.
+// The "n"/signature challenge these need is solved by Deno (see Dockerfile).
+const CLIENT_ARGS = ["--extractor-args", "youtube:player_client=web,tv"];
 
 function commonArgs() {
   return [...cookieArgs(), ...CLIENT_ARGS];
