@@ -4,6 +4,7 @@ const { spawn, execFile } = require("child_process");
 const path = require("path");
 const fs = require("fs");
 const crypto = require("crypto");
+const COOKIE_FILE = path.join(__dirname, "cookies.txt");
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -59,7 +60,9 @@ app.post("/api/info", (req, res) => {
   // execFile (no shell) -> args passed as an array, no injection risk
   execFile(
     "yt-dlp",
-    ["--dump-json", "--no-playlist", url],
+    ["--cookies",
+    COOKIE_FILE,"--dump-json", "--no-playlist", url],
+
     { maxBuffer: 1024 * 1024 * 10, timeout: 20000 },
     (error, stdout) => {
       if (error) {
@@ -111,6 +114,8 @@ app.post("/api/download", (req, res) => {
       ? `bv*[height<=${height}]+ba/b[height<=${height}]`
       : "bv*+ba/b";
     args = [
+         "--cookies",
+ COOKIE_FILE,
       "-f", formatStr,
       "--merge-output-format", "mp4",
       "-o", outputTemplate,
@@ -121,6 +126,8 @@ app.post("/api/download", (req, res) => {
   } else {
     const bitrate = ["128", "192", "320"].includes(quality) ? quality : "192";
     args = [
+         "--cookies",
+ COOKIE_FILE,
       "-x", "--audio-format", "mp3",
       "--audio-quality", `${bitrate}K`,
       "-o", outputTemplate,
