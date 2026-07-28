@@ -4,10 +4,10 @@ const { spawn, execFile } = require("child_process");
 const path = require("path");
 const fs = require("fs");
 const crypto = require("crypto");
+const COOKIE_FILE = path.join(__dirname, "cookies.txt");
 
 const app = express();
 const PORT = process.env.PORT || 5000;
-const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN || "http://localhost:5173";
 const DOWNLOAD_DIR = path.join(__dirname, "downloads");
 
 // yt.be / youtube.com/watch/shorts/embed — anything else gets rejected
@@ -16,7 +16,40 @@ const YT_URL_REGEX =
 
 if (!fs.existsSync(DOWNLOAD_DIR)) fs.mkdirSync(DOWNLOAD_DIR, { recursive: true });
 
-app.use(cors({ origin: CLIENT_ORIGIN }));
+// ---------------------------------------------------------------------
+// CORS — allow the production frontend, localhost dev, AND any Vercel
+// preview-deployment URL for this project (Vercel generates a new
+// unique subdomain for every deploy, so a single exact-match string
+// breaks the moment you push a new commit / open a preview build).
+// ---------------------------------------------------------------------
+
+// comma-separated list of exact allowed origins, e.g.
+// CLIENT_ORIGIN="https://yt-dowloader-three.vercel.app,http://localhost:5173"
+const EXPLICIT_ORIGINS = (process.env.CLIENT_ORIGIN || "http://localhost:5173")
+  .split(",")
+  .map((o) => o.trim().replace(/\/$/, "")) // strip trailing slash if someone pastes one
+  .filter(Boolean);
+
+// matches any preview URL Vercel generates for this project, e.g.
+// https://yt-dowloader-hroe2rwai-sparsh-kashyaps-projects.vercel.app
+const VERCEL_PREVIEW_REGEX = /^https:\/\/yt-dowloader-[a-z0-9]+-sparsh-kashyaps-projects\.vercel\.app$/i;
+
+function isAllowedOrigin(origin) {
+  if (!origin) return true; // non-browser requests (curl, server-to-server, health checks)
+  const clean = origin.replace(/\/$/, "");
+  return EXPLICIT_ORIGINS.includes(clean) || VERCEL_PREVIEW_REGEX.test(clean);
+}
+
+app.use(
+  cors({
+    origin: (origin, callback) => {
+      if (isAllowedOrigin(origin)) return callback(null, true);
+      console.warn("[CORS blocked]", origin);
+      callback(new Error("Not allowed by CORS"));
+    },
+  })
+);
+
 app.use(express.json());
 
 /**
@@ -46,6 +79,12 @@ function broadcast(jobId) {
   job.sseClients.forEach((res) => res.write(`data: ${payload}\n\n`));
 }
 
+// whether cookies.txt exists — if it doesn't, we skip --cookies instead of
+// crashing every single yt-dlp call with "cookies file not found"
+function cookieArgs() {
+  return fs.existsSync(COOKIE_FILE) ? ["--cookies", COOKIE_FILE] : [];
+}
+
 // ---------------------------------------------------------------------
 // GET video metadata (title, thumbnail, duration) before downloading
 // ---------------------------------------------------------------------
@@ -56,14 +95,16 @@ app.post("/api/info", (req, res) => {
     return res.status(400).json({ message: "Please paste a valid YouTube URL" });
   }
 
+  const args = [...cookieArgs(), "--dump-json", "--no-playlist", url];
+
   // execFile (no shell) -> args passed as an array, no injection risk
   execFile(
     "yt-dlp",
-    ["--dump-json", "--no-playlist", url],
+    args,
     { maxBuffer: 1024 * 1024 * 10, timeout: 20000 },
-    (error, stdout) => {
+    (error, stdout, stderr) => {
       if (error) {
-        console.error("[info error]", error.message);
+        console.error("[info error]", stderr || error.message);
         return res
           .status(500)
           .json({ message: "Couldn't fetch video info. Check the link and try again." });
@@ -111,6 +152,7 @@ app.post("/api/download", (req, res) => {
       ? `bv*[height<=${height}]+ba/b[height<=${height}]`
       : "bv*+ba/b";
     args = [
+      ...cookieArgs(),
       "-f", formatStr,
       "--merge-output-format", "mp4",
       "-o", outputTemplate,
@@ -121,6 +163,7 @@ app.post("/api/download", (req, res) => {
   } else {
     const bitrate = ["128", "192", "320"].includes(quality) ? quality : "192";
     args = [
+      ...cookieArgs(),
       "-x", "--audio-format", "mp3",
       "--audio-quality", `${bitrate}K`,
       "-o", outputTemplate,
