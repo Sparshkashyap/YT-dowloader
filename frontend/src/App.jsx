@@ -12,8 +12,10 @@ import {
   XCircle,
   Clock,
   Eye,
+  ShieldCheck,
 } from "lucide-react";
 import "./index.css";
+import { getConsent, setConsent, initAnalytics, trackEvent } from "./analytics";
 
 const API = import.meta.env.VITE_BACKEND_URL || "http://localhost:5000";
 
@@ -102,6 +104,7 @@ function App() {
   const [errorMsg, setErrorMsg] = useState("");
   const [readyJobId, setReadyJobId] = useState(null);
   const [justDetected, setJustDetected] = useState(false);
+  const [showConsent, setShowConsent] = useState(false);
 
   const debounceRef = useRef(null);
   const eventSourceRef = useRef(null);
@@ -110,6 +113,26 @@ function App() {
   useEffect(() => {
     setQuality(type === "video" ? "best" : "192");
   }, [type]);
+
+  // analytics consent: ask once; if already answered, respect it silently
+  useEffect(() => {
+    const consent = getConsent();
+    if (consent === "granted") {
+      initAnalytics();
+    } else if (consent === null) {
+      setShowConsent(true);
+    }
+  }, []);
+
+  const acceptAnalytics = () => {
+    setConsent("granted");
+    setShowConsent(false);
+  };
+
+  const declineAnalytics = () => {
+    setConsent("denied");
+    setShowConsent(false);
+  };
 
   // brand splash: hold for ~1.1s, fade out over 400ms -> ~1.5s total
   useEffect(() => {
@@ -168,6 +191,7 @@ function App() {
     setProgress(0);
     setStage("starting");
     setReadyJobId(null);
+    trackEvent("download_started", { content_type: type, quality });
 
     try {
       const res = await axios.post(`${API}/api/download`, { url, type, quality });
@@ -185,11 +209,13 @@ function App() {
           setDownloading(false);
           setReadyJobId(jobId);
           celebrateDownload(type);
+          trackEvent("download_completed", { content_type: type, quality });
           es.close();
         }
         if (data.status === "error") {
           setDownloading(false);
           setErrorMsg(data.error || "Download failed");
+          trackEvent("download_failed", { content_type: type, reason: data.error || "unknown" });
           es.close();
         }
       };
@@ -201,6 +227,7 @@ function App() {
       setDownloading(false);
       setStage("error");
       setErrorMsg(err.response?.data?.message || "Couldn't start download");
+      trackEvent("download_failed", { content_type: type, reason: "request_error" });
     }
   };
 
@@ -369,6 +396,25 @@ function App() {
         <p className="app-footer">Fast • Simple • Free</p>
       </div>
     </div>
+
+    {showConsent && (
+      <div className="consent-banner">
+        <div className="consent-icon">
+          <ShieldCheck size={20} />
+        </div>
+        <p className="consent-text">
+          Ye site anonymous usage analytics (Google Analytics) use karti hai taaki hum tool ko behtar bana sakein — no personal data, sirf aggregate stats.
+        </p>
+        <div className="consent-actions">
+          <button className="consent-btn decline" onClick={declineAnalytics}>
+            Decline
+          </button>
+          <button className="consent-btn accept" onClick={acceptAnalytics}>
+            Allow
+          </button>
+        </div>
+      </div>
+    )}
     </>
   );
 }

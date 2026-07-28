@@ -781,3 +781,96 @@ code {
     height: 64px;
   }
 }
+
+/* ---- analytics consent banner ---- */
+
+.consent-banner {
+  position: fixed;
+  left: 20px;
+  right: 20px;
+  bottom: 20px;
+  max-width: 560px;
+  margin: 0 auto;
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  background: var(--surface-2, #1c1d24);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow);
+  padding: 16px 18px;
+  backdrop-filter: blur(16px);
+  animation: consent-in 350ms ease;
+}
+
+@keyframes consent-in {
+  from {
+    opacity: 0;
+    transform: translateY(16px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.consent-icon {
+  flex-shrink: 0;
+  color: var(--accent);
+}
+
+.consent-text {
+  flex: 1;
+  font-size: 13px;
+  line-height: 1.4;
+  color: var(--muted);
+}
+
+.consent-actions {
+  display: flex;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.consent-btn {
+  border: none;
+  border-radius: var(--radius-sm);
+  padding: 8px 14px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  font-family: var(--sans);
+  transition: opacity var(--transition);
+}
+
+.consent-btn:hover {
+  opacity: 0.85;
+}
+
+.consent-btn.decline {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--muted);
+}
+
+.consent-btn.accept {
+  background: var(--video);
+  color: #fff;
+}
+
+@media (max-width: 640px) {
+  .consent-banner {
+    flex-direction: column;
+    align-items: flex-start;
+    left: 12px;
+    right: 12px;
+    bottom: 12px;
+  }
+  .consent-actions {
+    width: 100%;
+  }
+  .consent-btn {
+    flex: 1;
+  }
+}
