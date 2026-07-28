@@ -15,7 +15,7 @@ import {
 } from "lucide-react";
 import "./index.css";
 
-const API = "http://localhost:5000";
+const API = import.meta.env.VITE_BACKEND_URL;
 
 const VIDEO_QUALITIES = [
   { value: "best", label: "Best available" },
