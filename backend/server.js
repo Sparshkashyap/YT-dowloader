@@ -8,7 +8,9 @@ const crypto = require("crypto");
 const app = express();
 const PORT = process.env.PORT || 5000;
 const DOWNLOAD_DIR = path.join(__dirname, "downloads");
-const COOKIE_FILE = path.join(__dirname, "cookies.txt");
+
+const RAPIDAPI_KEY = process.env.RAPIDAPI_KEY;
+const RAPIDAPI_HOST = process.env.RAPIDAPI_HOST || "ytstream-download-youtube-videos.p.rapidapi.com";
 
 if (!fs.existsSync(DOWNLOAD_DIR)) fs.mkdirSync(DOWNLOAD_DIR, { recursive: true });
 
@@ -24,9 +26,9 @@ const allowedOrigins = [
 app.use(
   cors({
     origin: (origin, callback) => {
-      if (!origin) return callback(null, true); // curl / server-to-server / health checks
+      if (!origin) return callback(null, true);
       if (allowedOrigins.includes(origin)) return callback(null, true);
-      if (origin.endsWith(".vercel.app")) return callback(null, true); // any preview/prod Vercel deploy
+      if (origin.endsWith(".vercel.app")) return callback(null, true);
       console.log("[CORS blocked]", origin);
       callback(new Error("Not allowed by CORS"));
     },
@@ -36,13 +38,116 @@ app.use(
 app.use(express.json());
 
 // ---------------------------------------------------------------------
-// URL validation
+// URL / video-id handling
 // ---------------------------------------------------------------------
 const YT_URL_REGEX =
   /^(https?:\/\/)?(www\.)?(youtube\.com\/(watch\?v=|shorts\/|embed\/)|youtu\.be\/)[\w-]+/i;
 
 function isValidYoutubeUrl(url) {
   return typeof url === "string" && YT_URL_REGEX.test(url.trim());
+}
+
+function extractVideoId(url) {
+  const patterns = [
+    /(?:youtube\.com\/watch\?v=)([\w-]+)/,
+    /(?:youtube\.com\/shorts\/)([\w-]+)/,
+    /(?:youtube\.com\/embed\/)([\w-]+)/,
+    /(?:youtu\.be\/)([\w-]+)/,
+  ];
+  for (const re of patterns) {
+    const match = url.match(re);
+    if (match) return match[1];
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------
+// RapidAPI (YTStream) call — returns formats/adaptiveFormats with direct
+// googlevideo.com CDN links. No bot-check, no cookies, no proxy needed.
+// ---------------------------------------------------------------------
+async function fetchStreamData(videoId) {
+  if (!RAPIDAPI_KEY) throw new Error("RAPIDAPI_KEY not configured on server");
+
+  const res = await fetch(`https://${RAPIDAPI_HOST}/dl?id=${videoId}`, {
+    headers: {
+      "x-rapidapi-key": RAPIDAPI_KEY,
+      "x-rapidapi-host": RAPIDAPI_HOST,
+    },
+  });
+
+  if (!res.ok) throw new Error(`RapidAPI returned ${res.status}`);
+  const data = await res.json();
+  if (data.status !== "OK") throw new Error(data.errorId || "RapidAPI returned an error");
+  return data;
+}
+
+function pickVideoStream(adaptiveFormats, quality) {
+  const videoStreams = adaptiveFormats.filter((f) => f.mimeType?.startsWith("video/"));
+  if (!videoStreams.length) return null;
+
+  // prefer mp4 (avc1) for best compatibility with ffmpeg muxing + playback
+  const mp4Streams = videoStreams.filter((f) => f.mimeType.includes("mp4"));
+  const pool = mp4Streams.length ? mp4Streams : videoStreams;
+
+  const heightMap = { "1080p": 1080, "720p": 720, "480p": 480 };
+  const targetHeight = heightMap[quality];
+
+  const sorted = [...pool].sort((a, b) => (b.height || 0) - (a.height || 0));
+
+  if (!targetHeight) return sorted[0]; // "best"
+
+  // closest match at or below the requested height, else the smallest available
+  const atOrBelow = sorted.filter((f) => (f.height || 0) <= targetHeight);
+  return atOrBelow[0] || sorted[sorted.length - 1];
+}
+
+function pickAudioStream(adaptiveFormats) {
+  const audioStreams = adaptiveFormats.filter((f) => f.mimeType?.startsWith("audio/"));
+  if (!audioStreams.length) return null;
+
+  // prefer audio/mp4 (AAC) — muxes cleanly into an mp4 container
+  const mp4Audio = audioStreams.filter((f) => f.mimeType.includes("mp4"));
+  const pool = mp4Audio.length ? mp4Audio : audioStreams;
+
+  return [...pool].sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0];
+}
+
+// ---------------------------------------------------------------------
+// Stream a remote URL to a local file, reporting progress via callback
+// ---------------------------------------------------------------------
+async function downloadToFile(url, destPath, onProgress) {
+  const res = await fetch(url);
+  if (!res.ok || !res.body) throw new Error(`Stream download failed (${res.status})`);
+
+  const total = parseInt(res.headers.get("content-length") || "0", 10);
+  let loaded = 0;
+
+  const writeStream = fs.createWriteStream(destPath);
+  const reader = res.body.getReader();
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    loaded += value.length;
+    writeStream.write(Buffer.from(value));
+    if (total && onProgress) onProgress(loaded / total);
+  }
+
+  await new Promise((resolve, reject) => {
+    writeStream.end((err) => (err ? reject(err) : resolve()));
+  });
+}
+
+function runFfmpeg(args) {
+  return new Promise((resolve, reject) => {
+    const child = spawn("ffmpeg", args);
+    let stderr = "";
+    child.stderr.on("data", (d) => (stderr += d.toString()));
+    child.on("close", (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(`ffmpeg exited ${code}: ${stderr.slice(-300)}`));
+    });
+  });
 }
 
 // ---------------------------------------------------------------------
@@ -62,116 +167,13 @@ function broadcast(jobId) {
     progress: job.progress,
     error: job.error || null,
     fileName: job.fileName || null,
-    attempt: job.attempt || null, // which client is currently being tried
   });
   job.clients.forEach((res) => res.write(`data: ${payload}\n\n`));
 }
 
 // ---------------------------------------------------------------------
-// yt-dlp client fallback chain
-//
-// YouTube's bot-check behaves differently per "client" yt-dlp pretends to
-// be. No single client is reliably unblocked — it shifts over time and by
-// IP range — so instead of picking one, we try several in order and move
-// to the next the moment one fails. Cookies (if present) help the
-// cookie-aware clients; clients that don't support cookies just ignore
-// them (yt-dlp skips them automatically with a warning).
-// ---------------------------------------------------------------------
-const CLIENT_CHAIN = ["android", "ios", "tv", "web_safari", "web"];
-
-function baseArgs() {
-  const args = ["--js-runtimes", "deno", "--no-playlist", "--retries", "2", "--fragment-retries", "2"];
-  if (fs.existsSync(COOKIE_FILE)) args.push("--cookies", COOKIE_FILE);
-  return args;
-}
-
-function buildFormatArgs(type, quality) {
-  if (type === "video") {
-    const heightMap = { "1080p": 1080, "720p": 720, "480p": 480, best: null };
-    const height = Object.prototype.hasOwnProperty.call(heightMap, quality) ? heightMap[quality] : null;
-    const formatStr = height ? `bv*[height<=${height}]+ba/b[height<=${height}]` : "bv*+ba/b";
-    return ["-f", formatStr, "--merge-output-format", "mp4"];
-  }
-  const bitrate = ["128", "192", "320"].includes(quality) ? quality : "192";
-  return ["-x", "--audio-format", "mp3", "--audio-quality", `${bitrate}K`];
-}
-
-/**
- * Try each client in CLIENT_CHAIN, one at a time, until one produces a
- * finished file (exit code 0) or the chain is exhausted.
- */
-function runWithFallback({ jobId, url, type, quality, outputTemplate, onDone }) {
-  const job = jobs.get(jobId);
-  if (!job) return;
-
-  let chainIndex = 0;
-
-  function attemptNext() {
-    if (chainIndex >= CLIENT_CHAIN.length) {
-      job.status = "error";
-      job.error = "Download failed. YouTube is blocking this server right now — try again in a bit.";
-      broadcast(jobId);
-      onDone(false);
-      return;
-    }
-
-    const client = CLIENT_CHAIN[chainIndex];
-    chainIndex += 1;
-
-    job.status = "downloading";
-    job.attempt = client;
-    job.progress = 0;
-    broadcast(jobId);
-
-    const args = [
-      ...baseArgs(),
-      "--extractor-args", `youtube:player_client=${client}`,
-      ...buildFormatArgs(type, quality),
-      "-o", outputTemplate,
-      "--newline",
-      url,
-    ];
-
-    const child = spawn("yt-dlp", args);
-    let lastErrLine = "";
-
-    child.stdout.on("data", (chunk) => {
-      const text = chunk.toString();
-      const match = text.match(/(\d{1,3}\.\d)%/);
-      if (match) {
-        job.progress = parseFloat(match[1]);
-        broadcast(jobId);
-      }
-    });
-
-    child.stderr.on("data", (chunk) => {
-      lastErrLine = chunk.toString().trim() || lastErrLine;
-      console.log(`[yt-dlp ${jobId} client=${client}]`, chunk.toString().trim());
-    });
-
-    child.on("error", () => {
-      // yt-dlp binary itself missing/crashed — no point trying other clients
-      job.status = "error";
-      job.error = "yt-dlp not found on server.";
-      broadcast(jobId);
-      onDone(false);
-    });
-
-    child.on("close", (code) => {
-      if (code === 0) {
-        onDone(true);
-        return;
-      }
-      console.log(`[yt-dlp ${jobId}] client "${client}" failed (${lastErrLine.slice(0, 120)}), trying next...`);
-      attemptNext();
-    });
-  }
-
-  attemptNext();
-}
-
-// ---------------------------------------------------------------------
-// GET video metadata via YouTube's public oEmbed API — no bot-check
+// GET video metadata — oEmbed (free, unlimited, no bot-check) for the
+// lightweight preview; RapidAPI quota is saved for actual downloads.
 // ---------------------------------------------------------------------
 app.post("/api/info", async (req, res) => {
   const { url } = req.body;
@@ -213,46 +215,106 @@ app.post("/api/download", (req, res) => {
     return res.status(400).json({ message: "Invalid type" });
   }
 
+  const videoId = extractVideoId(url);
+  if (!videoId) {
+    return res.status(400).json({ message: "Couldn't parse video ID from that URL" });
+  }
+
   const jobId = createJobId();
-  const outputTemplate = path.join(DOWNLOAD_DIR, `${jobId}.%(ext)s`);
-
   jobs.set(jobId, { status: "starting", progress: 0, clients: [] });
-
-  runWithFallback({
-    jobId,
-    url,
-    type,
-    quality,
-    outputTemplate,
-    onDone: (success) => {
-      const job = jobs.get(jobId);
-      if (!job) return;
-
-      if (!success) {
-        job.clients.forEach((r) => r.end());
-        return;
-      }
-
-      const files = fs.readdirSync(DOWNLOAD_DIR).filter((f) => f.startsWith(jobId));
-      if (!files.length) {
-        job.status = "error";
-        job.error = "File not found after download completed.";
-        broadcast(jobId);
-        job.clients.forEach((r) => r.end());
-        return;
-      }
-
-      job.status = "done";
-      job.progress = 100;
-      job.filePath = path.join(DOWNLOAD_DIR, files[0]);
-      job.fileName = files[0];
-      broadcast(jobId);
-      job.clients.forEach((r) => r.end());
-    },
-  });
-
   res.json({ jobId });
+
+  processDownload({ jobId, videoId, type, quality }).catch((err) => {
+    const job = jobs.get(jobId);
+    if (!job) return;
+    console.log(`[job ${jobId}] failed:`, err.message);
+    job.status = "error";
+    job.error = "Download failed. The video may be unavailable, or the service hit its request limit.";
+    broadcast(jobId);
+    job.clients.forEach((r) => r.end());
+  });
 });
+
+async function processDownload({ jobId, videoId, type, quality }) {
+  const job = jobs.get(jobId);
+  if (!job) return;
+
+  job.status = "downloading";
+  job.progress = 2;
+  broadcast(jobId);
+
+  const data = await fetchStreamData(videoId);
+  const adaptiveFormats = data.adaptiveFormats || [];
+
+  const tmpVideo = path.join(DOWNLOAD_DIR, `${jobId}.video.tmp`);
+  const tmpAudio = path.join(DOWNLOAD_DIR, `${jobId}.audio.tmp`);
+  let finalPath;
+  let finalName;
+
+  if (type === "audio") {
+    const bitrate = ["128", "192", "320"].includes(quality) ? quality : "192";
+    const audioStream = pickAudioStream(adaptiveFormats);
+    if (!audioStream) throw new Error("No audio stream available");
+
+    await downloadToFile(audioStream.url, tmpAudio, (frac) => {
+      job.progress = Math.round(5 + frac * 80); // 5-85% = download
+      broadcast(jobId);
+    });
+
+    job.progress = 88;
+    broadcast(jobId);
+
+    finalName = `${jobId}.mp3`;
+    finalPath = path.join(DOWNLOAD_DIR, finalName);
+    await runFfmpeg(["-y", "-i", tmpAudio, "-vn", "-b:a", `${bitrate}k`, "-ar", "44100", finalPath]);
+
+    fs.unlink(tmpAudio, () => {});
+  } else {
+    const videoStream = pickVideoStream(adaptiveFormats, quality);
+    const audioStream = pickAudioStream(adaptiveFormats);
+    if (!videoStream || !audioStream) throw new Error("Required streams not available");
+
+    const videoTotal = parseInt(videoStream.contentLength || "0", 10) || 1;
+    const audioTotal = parseInt(audioStream.contentLength || "0", 10) || 1;
+    const combinedTotal = videoTotal + audioTotal;
+
+    await downloadToFile(videoStream.url, tmpVideo, (frac) => {
+      job.progress = Math.round(5 + (frac * videoTotal * 75) / combinedTotal);
+      broadcast(jobId);
+    });
+
+    await downloadToFile(audioStream.url, tmpAudio, (frac) => {
+      job.progress = Math.round(5 + ((videoTotal + frac * audioTotal) * 75) / combinedTotal);
+      broadcast(jobId);
+    });
+
+    job.progress = 90;
+    broadcast(jobId);
+
+    finalName = `${jobId}.mp4`;
+    finalPath = path.join(DOWNLOAD_DIR, finalName);
+    // -c copy: no re-encoding, just remux — fast, and preserves original quality
+    await runFfmpeg([
+      "-y",
+      "-i", tmpVideo,
+      "-i", tmpAudio,
+      "-c", "copy",
+      "-map", "0:v:0",
+      "-map", "1:a:0",
+      finalPath,
+    ]);
+
+    fs.unlink(tmpVideo, () => {});
+    fs.unlink(tmpAudio, () => {});
+  }
+
+  job.status = "done";
+  job.progress = 100;
+  job.filePath = finalPath;
+  job.fileName = finalName;
+  broadcast(jobId);
+  job.clients.forEach((r) => r.end());
+}
 
 // ---------------------------------------------------------------------
 // Live progress stream
@@ -267,7 +329,7 @@ app.get("/api/progress/:jobId", (req, res) => {
     "Cache-Control": "no-cache",
     Connection: "keep-alive",
   });
-  res.write(`data: ${JSON.stringify({ status: job.status, progress: job.progress, attempt: job.attempt })}\n\n`);
+  res.write(`data: ${JSON.stringify({ status: job.status, progress: job.progress })}\n\n`);
   job.clients.push(res);
 
   req.on("close", () => {
