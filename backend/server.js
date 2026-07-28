@@ -115,9 +115,20 @@ function pickAudioStream(adaptiveFormats) {
 // ---------------------------------------------------------------------
 // Stream a remote URL to a local file, reporting progress via callback
 // ---------------------------------------------------------------------
+const CDN_HEADERS = {
+  "User-Agent":
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+  "Referer": "https://www.youtube.com/",
+  "Origin": "https://www.youtube.com",
+  "Accept": "*/*",
+};
+
 async function downloadToFile(url, destPath, onProgress) {
-  const res = await fetch(url);
-  if (!res.ok || !res.body) throw new Error(`Stream download failed (${res.status})`);
+  const res = await fetch(url, { headers: CDN_HEADERS });
+  if (!res.ok || !res.body) {
+    const bodyText = await res.text().catch(() => "");
+    throw new Error(`Stream download failed (${res.status}) ${bodyText.slice(0, 150)}`);
+  }
 
   const total = parseInt(res.headers.get("content-length") || "0", 10);
   let loaded = 0;
