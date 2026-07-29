@@ -99,12 +99,15 @@ function App() {
   const [infoError, setInfoError] = useState("");
 
   const [downloading, setDownloading] = useState(false);
+  const [progress, setProgress] = useState(0);
+  const [stage, setStage] = useState("");
   const [errorMsg, setErrorMsg] = useState("");
-  const [readyFile, setReadyFile] = useState(null); // { url, fileName }
+  const [readyJobId, setReadyJobId] = useState(null);
   const [justDetected, setJustDetected] = useState(false);
   const [showConsent, setShowConsent] = useState(false);
 
   const debounceRef = useRef(null);
+  const eventSourceRef = useRef(null);
   const revealTimerRef = useRef(null);
 
   useEffect(() => {
@@ -144,7 +147,8 @@ function App() {
   useEffect(() => {
     setVideoInfo(null);
     setInfoError("");
-    setReadyFile(null);
+    setReadyJobId(null);
+    setStage("");
 
     if (!url.trim()) return;
 
@@ -171,6 +175,7 @@ function App() {
 
   useEffect(() => {
     return () => {
+      if (eventSourceRef.current) eventSourceRef.current.close();
       clearTimeout(revealTimerRef.current);
     };
   }, []);
@@ -183,21 +188,50 @@ function App() {
 
     setDownloading(true);
     setErrorMsg("");
-    setReadyFile(null);
+    setProgress(0);
+    setStage("starting");
+    setReadyJobId(null);
     trackEvent("download_started", { content_type: type, quality });
 
     try {
       const res = await axios.post(`${API}/api/download`, { url, type, quality });
-      setReadyFile({ url: res.data.downloadUrl, fileName: res.data.fileName });
-      celebrateDownload(type);
-      trackEvent("download_completed", { content_type: type, quality });
+      const { jobId } = res.data;
+
+      const es = new EventSource(`${API}/api/progress/${jobId}`);
+      eventSourceRef.current = es;
+
+      es.onmessage = (event) => {
+        const data = JSON.parse(event.data);
+        setStage(data.status);
+        setProgress(data.progress || 0);
+
+        if (data.status === "done") {
+          setDownloading(false);
+          setReadyJobId(jobId);
+          celebrateDownload(type);
+          trackEvent("download_completed", { content_type: type, quality });
+          es.close();
+        }
+        if (data.status === "error") {
+          setDownloading(false);
+          setErrorMsg(data.error || "Download failed");
+          trackEvent("download_failed", { content_type: type, reason: data.error || "unknown" });
+          es.close();
+        }
+      };
+
+      es.onerror = () => {
+        es.close();
+      };
     } catch (err) {
-      setErrorMsg(err.response?.data?.message || "Couldn't get a download link");
-      trackEvent("download_failed", { content_type: type, reason: "request_error" });
-    } finally {
       setDownloading(false);
+      setStage("error");
+      setErrorMsg(err.response?.data?.message || "Couldn't start download");
+      trackEvent("download_failed", { content_type: type, reason: "request_error" });
     }
   };
+
+  const fileHref = readyJobId ? `${API}/api/file/${readyJobId}` : null;
 
   return (
     <>
@@ -322,7 +356,7 @@ function App() {
             {downloading ? (
               <>
                 <Loader2 className="spinner" size={18} />
-                Getting your link...
+                {stage === "starting" ? "Starting..." : `Downloading... ${progress.toFixed(0)}%`}
               </>
             ) : (
               <>
@@ -332,6 +366,12 @@ function App() {
             )}
           </button>
 
+          {downloading && (
+            <div className="progress-track">
+              <div className="progress-fill" style={{ width: `${progress}%` }} />
+            </div>
+          )}
+
           {errorMsg && !downloading && (
             <div className="alert alert-danger">
               <p className="alert-danger-text">
@@ -340,14 +380,14 @@ function App() {
             </div>
           )}
 
-          {readyFile && (
+          {readyJobId && (
             <div className="alert alert-success">
               <p className="alert-success-text">
                 <CheckCircle2 size={18} /> Ready to save
               </p>
-              <a href={readyFile.url} download={readyFile.fileName} className="save-btn">
+              <a href={fileHref} className="save-btn">
                 <Download size={18} />
-                Save {type === "video" ? "MP4" : "Audio"}
+                Save {type === "video" ? "MP4" : "MP3"}
               </a>
             </div>
           )}
