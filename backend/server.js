@@ -1,18 +1,11 @@
 const express = require("express");
 const cors = require("cors");
-const { spawn } = require("child_process");
-const path = require("path");
-const fs = require("fs");
-const crypto = require("crypto");
 
 const app = express();
 const PORT = process.env.PORT || 5000;
-const DOWNLOAD_DIR = path.join(__dirname, "downloads");
 
 const RAPIDAPI_KEY = process.env.RAPIDAPI_KEY;
 const RAPIDAPI_HOST = process.env.RAPIDAPI_HOST || "ytstream-download-youtube-videos.p.rapidapi.com";
-
-if (!fs.existsSync(DOWNLOAD_DIR)) fs.mkdirSync(DOWNLOAD_DIR, { recursive: true });
 
 // ---------------------------------------------------------------------
 // CORS
@@ -62,8 +55,7 @@ function extractVideoId(url) {
 }
 
 // ---------------------------------------------------------------------
-// RapidAPI (YTStream) call — returns formats/adaptiveFormats with direct
-// googlevideo.com CDN links. No bot-check, no cookies, no proxy needed.
+// RapidAPI (YTStream) call
 // ---------------------------------------------------------------------
 async function fetchStreamData(videoId) {
   if (!RAPIDAPI_KEY) throw new Error("RAPIDAPI_KEY not configured on server");
@@ -81,110 +73,45 @@ async function fetchStreamData(videoId) {
   return data;
 }
 
-function pickVideoStream(adaptiveFormats, quality) {
-  const videoStreams = adaptiveFormats.filter((f) => f.mimeType?.startsWith("video/"));
-  if (!videoStreams.length) return null;
-
-  // prefer mp4 (avc1) for best compatibility with ffmpeg muxing + playback
-  const mp4Streams = videoStreams.filter((f) => f.mimeType.includes("mp4"));
-  const pool = mp4Streams.length ? mp4Streams : videoStreams;
+// Combined (single-file, video+audio already merged) formats only — no
+// muxing needed, so the browser can download this URL directly. YouTube
+// only offers these up to ~360p; higher qualities require separate
+// video/audio streams merged server-side, which we can't do (Render's IP
+// gets 403'd by the CDN when fetching video bytes directly).
+function pickCombinedFormat(formats, quality) {
+  if (!formats?.length) return null;
+  const sorted = [...formats].sort((a, b) => (b.height || 0) - (a.height || 0));
 
   const heightMap = { "1080p": 1080, "720p": 720, "480p": 480 };
   const targetHeight = heightMap[quality];
+  if (!targetHeight) return sorted[0]; // "best" available combined format
 
-  const sorted = [...pool].sort((a, b) => (b.height || 0) - (a.height || 0));
-
-  if (!targetHeight) return sorted[0]; // "best"
-
-  // closest match at or below the requested height, else the smallest available
   const atOrBelow = sorted.filter((f) => (f.height || 0) <= targetHeight);
   return atOrBelow[0] || sorted[sorted.length - 1];
 }
 
 function pickAudioStream(adaptiveFormats) {
-  const audioStreams = adaptiveFormats.filter((f) => f.mimeType?.startsWith("audio/"));
+  const audioStreams = (adaptiveFormats || []).filter((f) => f.mimeType?.startsWith("audio/"));
   if (!audioStreams.length) return null;
 
-  // prefer audio/mp4 (AAC) — muxes cleanly into an mp4 container
   const mp4Audio = audioStreams.filter((f) => f.mimeType.includes("mp4"));
   const pool = mp4Audio.length ? mp4Audio : audioStreams;
 
   return [...pool].sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0];
 }
 
-// ---------------------------------------------------------------------
-// Stream a remote URL to a local file, reporting progress via callback
-// ---------------------------------------------------------------------
-const CDN_HEADERS = {
-  "User-Agent":
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-  "Referer": "https://www.youtube.com/",
-  "Origin": "https://www.youtube.com",
-  "Accept": "*/*",
-};
-
-async function downloadToFile(url, destPath, onProgress) {
-  const res = await fetch(url, { headers: CDN_HEADERS });
-  if (!res.ok || !res.body) {
-    const bodyText = await res.text().catch(() => "");
-    throw new Error(`Stream download failed (${res.status}) ${bodyText.slice(0, 150)}`);
-  }
-
-  const total = parseInt(res.headers.get("content-length") || "0", 10);
-  let loaded = 0;
-
-  const writeStream = fs.createWriteStream(destPath);
-  const reader = res.body.getReader();
-
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    loaded += value.length;
-    writeStream.write(Buffer.from(value));
-    if (total && onProgress) onProgress(loaded / total);
-  }
-
-  await new Promise((resolve, reject) => {
-    writeStream.end((err) => (err ? reject(err) : resolve()));
-  });
+function extFromMime(mimeType) {
+  if (mimeType.includes("mp4")) return "m4a";
+  if (mimeType.includes("webm")) return "webm";
+  return "audio";
 }
 
-function runFfmpeg(args) {
-  return new Promise((resolve, reject) => {
-    const child = spawn("ffmpeg", args);
-    let stderr = "";
-    child.stderr.on("data", (d) => (stderr += d.toString()));
-    child.on("close", (code) => {
-      if (code === 0) resolve();
-      else reject(new Error(`ffmpeg exited ${code}: ${stderr.slice(-300)}`));
-    });
-  });
+function sanitizeFilename(name) {
+  return name.replace(/[^\w\s.-]/g, "").trim().slice(0, 80) || "youtube-download";
 }
 
 // ---------------------------------------------------------------------
-// Job store + SSE broadcast
-// ---------------------------------------------------------------------
-const jobs = new Map();
-
-function createJobId() {
-  return crypto.randomBytes(8).toString("hex");
-}
-
-function broadcast(jobId) {
-  const job = jobs.get(jobId);
-  if (!job) return;
-  const payload = JSON.stringify({
-    status: job.status,
-    progress: job.progress,
-    error: job.error || null,
-    fileName: job.fileName || null,
-  });
-  job.clients.forEach((res) => res.write(`data: ${payload}\n\n`));
-}
-
-// ---------------------------------------------------------------------
-// GET video metadata — oEmbed (free, unlimited, no bot-check) for the
-// lightweight preview; RapidAPI quota is saved for actual downloads.
+// GET video metadata — oEmbed (free, unlimited, no bot-check)
 // ---------------------------------------------------------------------
 app.post("/api/info", async (req, res) => {
   const { url } = req.body;
@@ -214,9 +141,11 @@ app.post("/api/info", async (req, res) => {
 });
 
 // ---------------------------------------------------------------------
-// Start a download job
+// Resolve a direct, browser-downloadable CDN URL. Synchronous — no
+// server-side file processing, so there's nothing to stream progress on;
+// the browser handles the actual download using its own (unflagged) IP.
 // ---------------------------------------------------------------------
-app.post("/api/download", (req, res) => {
+app.post("/api/download", async (req, res) => {
   const { url, type, quality } = req.body;
 
   if (!isValidYoutubeUrl(url)) {
@@ -231,158 +160,39 @@ app.post("/api/download", (req, res) => {
     return res.status(400).json({ message: "Couldn't parse video ID from that URL" });
   }
 
-  const jobId = createJobId();
-  jobs.set(jobId, { status: "starting", progress: 0, clients: [] });
-  res.json({ jobId });
+  try {
+    const data = await fetchStreamData(videoId);
+    const safeTitle = sanitizeFilename(data.title || videoId);
 
-  processDownload({ jobId, videoId, type, quality }).catch((err) => {
-    const job = jobs.get(jobId);
-    if (!job) return;
-    console.log(`[job ${jobId}] failed:`, err.message);
-    job.status = "error";
-    job.error = "Download failed. The video may be unavailable, or the service hit its request limit.";
-    broadcast(jobId);
-    job.clients.forEach((r) => r.end());
-  });
-});
-
-async function processDownload({ jobId, videoId, type, quality }) {
-  const job = jobs.get(jobId);
-  if (!job) return;
-
-  job.status = "downloading";
-  job.progress = 2;
-  broadcast(jobId);
-
-  const data = await fetchStreamData(videoId);
-  const adaptiveFormats = data.adaptiveFormats || [];
-
-  const tmpVideo = path.join(DOWNLOAD_DIR, `${jobId}.video.tmp`);
-  const tmpAudio = path.join(DOWNLOAD_DIR, `${jobId}.audio.tmp`);
-  let finalPath;
-  let finalName;
-
-  if (type === "audio") {
-    const bitrate = ["128", "192", "320"].includes(quality) ? quality : "192";
-    const audioStream = pickAudioStream(adaptiveFormats);
-    if (!audioStream) throw new Error("No audio stream available");
-
-    await downloadToFile(audioStream.url, tmpAudio, (frac) => {
-      job.progress = Math.round(5 + frac * 80); // 5-85% = download
-      broadcast(jobId);
-    });
-
-    job.progress = 88;
-    broadcast(jobId);
-
-    finalName = `${jobId}.mp3`;
-    finalPath = path.join(DOWNLOAD_DIR, finalName);
-    await runFfmpeg(["-y", "-i", tmpAudio, "-vn", "-b:a", `${bitrate}k`, "-ar", "44100", finalPath]);
-
-    fs.unlink(tmpAudio, () => {});
-  } else {
-    const videoStream = pickVideoStream(adaptiveFormats, quality);
-    const audioStream = pickAudioStream(adaptiveFormats);
-    if (!videoStream || !audioStream) throw new Error("Required streams not available");
-
-    const videoTotal = parseInt(videoStream.contentLength || "0", 10) || 1;
-    const audioTotal = parseInt(audioStream.contentLength || "0", 10) || 1;
-    const combinedTotal = videoTotal + audioTotal;
-
-    await downloadToFile(videoStream.url, tmpVideo, (frac) => {
-      job.progress = Math.round(5 + (frac * videoTotal * 75) / combinedTotal);
-      broadcast(jobId);
-    });
-
-    await downloadToFile(audioStream.url, tmpAudio, (frac) => {
-      job.progress = Math.round(5 + ((videoTotal + frac * audioTotal) * 75) / combinedTotal);
-      broadcast(jobId);
-    });
-
-    job.progress = 90;
-    broadcast(jobId);
-
-    finalName = `${jobId}.mp4`;
-    finalPath = path.join(DOWNLOAD_DIR, finalName);
-    // -c copy: no re-encoding, just remux — fast, and preserves original quality
-    await runFfmpeg([
-      "-y",
-      "-i", tmpVideo,
-      "-i", tmpAudio,
-      "-c", "copy",
-      "-map", "0:v:0",
-      "-map", "1:a:0",
-      finalPath,
-    ]);
-
-    fs.unlink(tmpVideo, () => {});
-    fs.unlink(tmpAudio, () => {});
-  }
-
-  job.status = "done";
-  job.progress = 100;
-  job.filePath = finalPath;
-  job.fileName = finalName;
-  broadcast(jobId);
-  job.clients.forEach((r) => r.end());
-}
-
-// ---------------------------------------------------------------------
-// Live progress stream
-// ---------------------------------------------------------------------
-app.get("/api/progress/:jobId", (req, res) => {
-  const { jobId } = req.params;
-  const job = jobs.get(jobId);
-  if (!job) return res.status(404).end();
-
-  res.writeHead(200, {
-    "Content-Type": "text/event-stream",
-    "Cache-Control": "no-cache",
-    Connection: "keep-alive",
-  });
-  res.write(`data: ${JSON.stringify({ status: job.status, progress: job.progress })}\n\n`);
-  job.clients.push(res);
-
-  req.on("close", () => {
-    job.clients = job.clients.filter((c) => c !== res);
-  });
-});
-
-// ---------------------------------------------------------------------
-// Serve the completed file
-// ---------------------------------------------------------------------
-app.get("/api/file/:jobId", (req, res) => {
-  const { jobId } = req.params;
-  const job = jobs.get(jobId);
-
-  if (!job || job.status !== "done" || !job.filePath || !fs.existsSync(job.filePath)) {
-    return res.status(404).json({ message: "File not ready or already cleaned up" });
-  }
-
-  const ext = path.extname(job.fileName);
-  const niceName = `youtube-download-${jobId.slice(0, 6)}${ext}`;
-
-  res.download(job.filePath, niceName, (err) => {
-    if (err) console.error("[download error]", err.message);
-  });
-});
-
-// ---------------------------------------------------------------------
-// Housekeeping: delete files older than 1hr, every 30 min
-// ---------------------------------------------------------------------
-setInterval(() => {
-  fs.readdir(DOWNLOAD_DIR, (err, files) => {
-    if (err) return;
-    const now = Date.now();
-    files.forEach((f) => {
-      const filePath = path.join(DOWNLOAD_DIR, f);
-      fs.stat(filePath, (err, stats) => {
-        if (err) return;
-        if (now - stats.mtimeMs > 60 * 60 * 1000) fs.unlink(filePath, () => {});
+    if (type === "audio") {
+      const audioStream = pickAudioStream(data.adaptiveFormats);
+      if (!audioStream) {
+        return res.status(404).json({ message: "No audio stream available for this video." });
+      }
+      return res.json({
+        downloadUrl: audioStream.url,
+        fileName: `${safeTitle}.${extFromMime(audioStream.mimeType)}`,
       });
+    }
+
+    const combined = pickCombinedFormat(data.formats, quality);
+    if (!combined) {
+      return res.status(404).json({
+        message: "No direct-downloadable video format available for this video.",
+      });
+    }
+    return res.json({
+      downloadUrl: combined.url,
+      fileName: `${safeTitle}.mp4`,
+      qualityLabel: combined.qualityLabel,
     });
-  });
-}, 30 * 60 * 1000);
+  } catch (err) {
+    console.log("[download error]", err.message);
+    res.status(500).json({
+      message: "Couldn't get a download link. The video may be unavailable, or the service hit its request limit.",
+    });
+  }
+});
 
 app.listen(PORT, () => {
   console.log(`Server running on http://localhost:${PORT}`);
